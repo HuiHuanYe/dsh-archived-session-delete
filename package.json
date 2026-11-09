@@ -1,0 +1,58 @@
+{
+  "name": "dsh-archived-session-delete",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Adds a permanent delete action to the right-click menu of archived sessions in the DSH Web sidebar.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sessions",
+    "archive",
+    "delete"
+  ],
+  "license": "MIT",
+  "author": "HuiHuanYe (https://github.com/HuiHuanYe)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HuiHuanYe/dsh-archived-session-delete.git"
+  },
+  "homepage": "https://github.com/HuiHuanYe/dsh-archived-session-delete#readme",
+  "bugs": {
+    "url": "https://github.com/HuiHuanYe/dsh-archived-session-delete/issues"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remote-access",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-context-menu",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

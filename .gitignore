@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+pnpm-lock.yaml
+
+# local runtime state
+.verify-dsh-home/
+*.log
+
+# editors and OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

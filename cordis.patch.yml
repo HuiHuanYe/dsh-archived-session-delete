@@ -1,0 +1,8 @@
+# dsh-archived-session-delete — bundle patch
+#
+# One Host row: it registers the authenticated `POST /api/archived-sessions.delete`
+# route that permanently removes an archived Session's durable log. The browser
+# half is declared through `package.json` → `dsh.client` and loads automatically.
+- insert:
+    - id: archived-session-delete
+      name: 'dsh-archived-session-delete'

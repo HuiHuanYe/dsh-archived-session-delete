@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Archived session delete",
+    "description": "Adds a permanent delete action to the right-click menu of archived sessions in the sidebar."
+  }
+}
