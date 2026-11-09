@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "description": "Adds a permanent delete action to the right-click menu of archived sessions in the DSH Web sidebar.",
   "keywords": [
     "dsh",
@@ -37,8 +40,13 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check lib/session-delete.js",
+    "test": "node --test test/session-delete.test.mjs test/host-route.test.mjs test/client-wiring.test.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

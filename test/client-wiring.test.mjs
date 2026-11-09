@@ -178,7 +178,7 @@ test('client half registers locale, icon, overlay and one archived-session conte
   assert.equal(icon.options.key, 'archivedSessionDelete.delete')
 
   assert.ok(state.menu)
-  assert.equal(state.menu.id, 'session.deleteArchived')
+  assert.equal(state.menu.id, 'archived-session-delete.deleteArchived')
   assert.equal(state.menu.target, 'session')
   assert.equal(state.menu.order, 700)
   assert.equal(state.menu.observe({ sessionId: 'session-archived' }).length, 3)
@@ -323,6 +323,65 @@ test('a session that disappeared is reported as already gone instead of an error
     tree = expand(overlayRegistration.component({ t }))
     assert.equal(findAll(tree, (node) => node.props?.role === 'dialog').length, 0)
     assert.match(textOf(findAll(tree, (node) => node.props?.className === 'asd-toast')[0]), /已不存在/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('an unsupported storage backend keeps its dedicated explanation', async () => {
+  const definition = await loadClientHalf()
+  const plugin = definition.factory(() => reactStub)
+  const { context, state } = buildContext()
+  plugin.apply(context)
+  const overlayRegistration = state.registrations.find((entry) => entry.options.name === 'shell.overlay')
+  state.menu.resolve({ sessionId: 'session-archived', displayTitle: '旧的实验' })[0].run()
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({ ok: false, code: 'storage-unsupported', message: 'unsupported' }),
+  })
+  try {
+    const t = (key) => state.locale.dicts.zh[key] ?? key
+    let tree = expand(overlayRegistration.component({ t }))
+    findAll(tree, (node) => node.props?.className === 'asd-btn asd-btn-danger')[0].props.onClick()
+    await flush()
+    tree = expand(overlayRegistration.component({ t }))
+    const alert = findAll(tree, (node) => node.props?.role === 'alert')[0]
+    assert.ok(alert)
+    assert.match(textOf(alert), /不支持安全删除/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('a request timeout is reported instead of leaving the dialog busy forever', async () => {
+  const definition = await loadClientHalf()
+  const plugin = definition.factory(() => reactStub)
+  const { context, state } = buildContext()
+  plugin.apply(context)
+  const overlayRegistration = state.registrations.find((entry) => entry.options.name === 'shell.overlay')
+  state.menu.resolve({ sessionId: 'session-archived', displayTitle: '旧的实验' })[0].run()
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    const error = new Error('aborted')
+    error.name = 'AbortError'
+    throw error
+  }
+  try {
+    const t = (key) => state.locale.dicts.zh[key] ?? key
+    let tree = expand(overlayRegistration.component({ t }))
+    findAll(tree, (node) => node.props?.className === 'asd-btn asd-btn-danger')[0].props.onClick()
+    await flush()
+    tree = expand(overlayRegistration.component({ t }))
+    assert.equal(findAll(tree, (node) => node.props?.role === 'dialog').length, 1)
+    const dialog = findAll(tree, (node) => node.props?.role === 'dialog')[0]
+    assert.equal(dialog.props['aria-busy'], undefined)
+    const alert = findAll(tree, (node) => node.props?.role === 'alert')[0]
+    assert.ok(alert)
+    assert.match(textOf(alert), /超时/)
   } finally {
     globalThis.fetch = originalFetch
   }

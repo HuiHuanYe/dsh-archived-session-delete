@@ -264,3 +264,25 @@ test('concurrent deletions of one session are rejected as busy', async () => {
   assert.equal(firstResponse.status, 200)
   await fs.rm(world.home, { recursive: true, force: true })
 })
+
+test('an oversized declared request body is rejected before it is read', async () => {
+  const world = await makeWorld()
+  const { ctx, getRoute } = makeContext(world)
+  apply(ctx)
+  let read = false
+  const oversized = {
+    method: 'POST',
+    headers: new Headers({ 'content-length': String(10 * 1024 * 1024) }),
+    text: async () => {
+      read = true
+      return JSON.stringify({ sessionId: ROOT_ID })
+    },
+    signal: new AbortController().signal,
+  }
+  const response = await withEnvironment(world.home, () => getRoute().fetch(oversized))
+  assert.equal(response.status, 400)
+  assert.equal((await response.json()).code, 'invalid-request')
+  assert.equal(read, false, 'the body is not decoded when content-length already exceeds the cap')
+  assert.equal((await fs.lstat(world.locations.get(ROOT_ID))).isFile(), true)
+  await fs.rm(world.home, { recursive: true, force: true })
+})

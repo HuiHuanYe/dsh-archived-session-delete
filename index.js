@@ -34,6 +34,9 @@ export const inject = ['connection', 'sessionPersistence']
 /** Deletion requests currently being processed, keyed by session id. */
 const inFlight = new Set()
 
+/** Largest accepted JSON request body; the payload is one session id. */
+const MAX_REQUEST_BODY_BYTES = 64 * 1024
+
 /** HTTP status for each stable failure code. */
 const STATUS_BY_CODE = {
   'invalid-request': 400,
@@ -84,13 +87,20 @@ function json(status, body) {
  * @returns {Promise<{ sessionId: string }>} validated payload.
  */
 async function readPayload(request) {
+  // Reject an oversized declared body before decoding it: the /api bridge has
+  // already buffered the bytes, but this keeps the handler from materializing a
+  // huge string and gives a precise failure instead of a parse error.
+  const declaredLength = Number(request.headers.get('content-length') ?? '')
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    throw new SessionDeleteFailure('invalid-request', 'request body is too large')
+  }
   let text
   try {
     text = await request.text()
   } catch (error) {
     throw new SessionDeleteFailure('invalid-request', `request body could not be read: ${messageOf(error)}`)
   }
-  if (text.length > 256 * 1024) throw new SessionDeleteFailure('invalid-request', 'request body is too large')
+  if (text.length > MAX_REQUEST_BODY_BYTES) throw new SessionDeleteFailure('invalid-request', 'request body is too large')
   let payload
   try {
     payload = JSON.parse(text)
@@ -242,7 +252,7 @@ async function inspectSession(ctx, persistence, sessionId, signal) {
   }
   const artifact = classifySessionArtifact(snapshot.location.path)
   const inspected = await inspectSessionArtifact(artifact)
-  await claimWriteOwnership(persistence, sessionId)
+  await claimWriteOwnership(persistence, sessionId, signal)
   return { sessionId, missing: false, artifact, bytes: inspected.bytes }
 }
 
@@ -251,12 +261,13 @@ async function inspectSession(ctx, persistence, sessionId, signal) {
  * the authoritative "is anything still using this Session" probe.
  * @param {{ open: Function }} persistence session persistence service.
  * @param {string} sessionId Session to claim.
+ * @param {AbortSignal} signal request lifetime.
  * @returns {Promise<void>} resolution after ownership was claimed and released.
  */
-async function claimWriteOwnership(persistence, sessionId) {
+async function claimWriteOwnership(persistence, sessionId, signal) {
   let handle
   try {
-    handle = await persistence.open(sessionId, 'write')
+    handle = await persistence.open(sessionId, 'write', { signal })
   } catch (error) {
     if (isPersistenceNotFound(error)) {
       throw new SessionDeleteFailure('session-not-found', `session "${sessionId}" disappeared during deletion`, { sessionId })
@@ -334,6 +345,8 @@ async function executePlans(ctx, plans) {
   const removed = []
   /** @type {Array<{ sessionId: string, message: string }>} */
   const failures = []
+  /** @type {string[]} */
+  const warnings = []
   let bytes = 0
   let cacheRemoved = 0
 
@@ -342,11 +355,16 @@ async function executePlans(ctx, plans) {
       removed.push(plan.sessionId)
       continue
     }
+    let cleanupWarning
     try {
-      await removeSessionArtifact(plan.artifact)
+      cleanupWarning = await removeSessionArtifact(plan.artifact)
     } catch (error) {
       failures.push({ sessionId: plan.sessionId, message: messageOf(error) })
       continue
+    }
+    if (cleanupWarning !== undefined) {
+      warnings.push(`${plan.sessionId}: ${cleanupWarning}`)
+      console.warn('[archived-session-delete]', cleanupWarning)
     }
     bytes += plan.bytes ?? 0
     removed.push(plan.sessionId)
@@ -374,7 +392,12 @@ async function executePlans(ctx, plans) {
       ok: false,
       code: 'delete-partial',
       message: 'some session artifacts could not be removed',
-      details: { failures, removedSessionIds: removed, bytes },
+      details: {
+        failures,
+        removedSessionIds: removed,
+        bytes,
+        ...(warnings.length === 0 ? {} : { warnings }),
+      },
     })
   }
   return json(200, {
@@ -384,6 +407,7 @@ async function executePlans(ctx, plans) {
     bytes,
     cacheRemoved,
     alreadyGone: plans.every((plan) => plan.missing),
+    ...(warnings.length === 0 ? {} : { warnings }),
   })
 }
 

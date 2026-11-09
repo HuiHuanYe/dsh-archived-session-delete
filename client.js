@@ -21,8 +21,13 @@ window.__ModuleLoader__.load({
     const NS = 'archivedSessionDelete'
     /** Icon key registered in the context menu's icon seat. */
     const ICON_KEY = 'archivedSessionDelete.delete'
-    /** Document-relative form of the Host route, resolved against the page base. */
+    /**
+     * Document-relative form of the Host route, resolved against the page base.
+     * Keep in sync with DELETE_ROUTE_PATH in lib/session-delete.js.
+     */
     const ROUTE = '/api/archived-sessions.delete'.slice(1)
+    /** Abort the Host request when it stops answering, so the dialog cannot hang. */
+    const REQUEST_TIMEOUT_MS = 30000
 
     const CSS = `
 .asd-backdrop{position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.42);animation:asd-fade .12s ease-out}
@@ -63,6 +68,7 @@ window.__ModuleLoader__.load({
       'error.busy': 'Another delete request for this session is already running.',
       'error.invalid': 'The delete request was rejected as invalid.',
       'error.partial': 'Some session files could not be deleted. Try again in a moment.',
+      'error.timeout': 'The delete request timed out. Try again in a moment.',
       'error.failed': 'Delete failed: {message}',
       'toast.deleted': 'Deleted archived session “{title}”.',
       'toast.deletedSize': 'Deleted archived session “{title}” and freed {size}.',
@@ -87,6 +93,7 @@ window.__ModuleLoader__.load({
       'error.busy': '该会话已有一个删除操作在进行中。',
       'error.invalid': '删除请求不合法，已被拒绝。',
       'error.partial': '部分会话文件删除失败，请稍后重试。',
+      'error.timeout': '删除请求超时，请稍后重试。',
       'error.failed': '删除失败：{message}',
       'toast.deleted': '已删除归档会话「{title}」。',
       'toast.deletedSize': '已删除归档会话「{title}」，释放 {size}。',
@@ -200,18 +207,25 @@ window.__ModuleLoader__.load({
      * @returns {Promise<{ ok: boolean, status: number, payload: any }>} normalized result.
      */
     async function postDelete(sessionId) {
-      const response = await fetch(ROUTE, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
-      })
-      let payload = null
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
       try {
-        payload = await response.json()
-      } catch {
-        payload = null
+        const response = await fetch(ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId }),
+          signal: controller.signal,
+        })
+        let payload = null
+        try {
+          payload = await response.json()
+        } catch {
+          payload = null
+        }
+        return { ok: response.ok && payload !== null && payload.ok === true, status: response.status, payload }
+      } finally {
+        clearTimeout(timer)
       }
-      return { ok: response.ok && payload !== null && payload.ok === true, status: response.status, payload }
     }
 
     /**
@@ -232,6 +246,7 @@ window.__ModuleLoader__.load({
         case 'storage-migration-required':
           return t('error.migration')
         case 'storage-unsupported':
+          return t('error.unsupported')
         case 'storage-unexpected-entry':
           return t('error.unexpected')
         case 'delete-busy':
@@ -259,7 +274,12 @@ window.__ModuleLoader__.load({
       try {
         result = await postDelete(dialog.sessionId)
       } catch (error) {
-        ui.set({ ...ui.get(), busy: false, error: t('error.failed', { message: messageOf(error) }) })
+        const timedOut = error !== null && typeof error === 'object' && error.name === 'AbortError'
+        ui.set({
+          ...ui.get(),
+          busy: false,
+          error: timedOut ? t('error.timeout') : t('error.failed', { message: messageOf(error) }),
+        })
         return
       }
       const current = ui.get()
@@ -310,7 +330,6 @@ window.__ModuleLoader__.load({
      * @returns {object} the dialog element.
      */
     function ConfirmDialog({ dialog, busy, error, onCancel, onConfirm, t }) {
-      const backdropRef = React.useRef(null)
       const dialogRef = React.useRef(null)
       const cancelRef = React.useRef(null)
       const busyRef = React.useRef(busy)
@@ -359,7 +378,6 @@ window.__ModuleLoader__.load({
       return React.createElement(
         'div',
         {
-          ref: backdropRef,
           className: 'asd-backdrop',
           onMouseDown: (event) => {
             if (event.target === event.currentTarget && !busy) onCancel()
@@ -372,6 +390,7 @@ window.__ModuleLoader__.load({
             className: 'asd-dialog',
             role: 'dialog',
             'aria-modal': 'true',
+            'aria-busy': busy ? 'true' : undefined,
             'aria-labelledby': 'asd-title',
             'aria-describedby': 'asd-desc',
             onMouseDown: (event) => event.stopPropagation(),
@@ -535,7 +554,7 @@ window.__ModuleLoader__.load({
       ctx.effect(
         () =>
           ctx.contextMenus.register({
-            id: 'session.deleteArchived',
+            id: 'archived-session-delete.deleteArchived',
             target: 'session',
             order: 700,
             observe: ({ sessionId }) => menuSources(ctx, sessionId),

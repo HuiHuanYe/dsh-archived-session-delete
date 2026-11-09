@@ -104,6 +104,42 @@ test('inspectSessionArtifact tolerates a writer lock but refuses unknown entries
   }
 })
 
+test('removeSessionArtifact re-validates immediately before removing', async () => {
+  const root = await makeTempRoot()
+  try {
+    const location = sessionArtifactPath(root)
+    await fs.mkdir(path.dirname(location), { recursive: true })
+    await fs.writeFile(location, 'log')
+    const artifact = classifySessionArtifact(location)
+    await inspectSessionArtifact(artifact)
+    await fs.writeFile(path.join(path.dirname(location), 'notes.txt'), 'appeared later')
+    await assert.rejects(removeSessionArtifact(artifact), (error) => {
+      assert.ok(error instanceof SessionDeleteFailure)
+      assert.equal(error.code, 'storage-unexpected-entry')
+      return true
+    })
+    assert.equal((await fs.lstat(location)).isFile(), true, 'nothing is removed on a failed re-validation')
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an empty session-owned directory is inspectable and removable', async () => {
+  const root = await makeTempRoot()
+  try {
+    const location = sessionArtifactPath(root)
+    await fs.mkdir(path.dirname(location), { recursive: true })
+    const artifact = classifySessionArtifact(location)
+    const inspected = await inspectSessionArtifact(artifact)
+    assert.deepEqual(inspected.files, [])
+    assert.equal(inspected.bytes, 0)
+    await removeSessionArtifact(artifact)
+    await assert.rejects(fs.lstat(path.dirname(location)), { code: 'ENOENT' })
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test('looksLikeProjectionCacheRecord recognizes the persisted record shape', () => {
   assert.equal(looksLikeProjectionCacheRecord({ version: 7, record: { identity: { formatVersion: 4 }, rows: {} } }), true)
   assert.equal(looksLikeProjectionCacheRecord({ version: 7, record: {} }), false)
@@ -130,6 +166,11 @@ test('removeProjectionCache removes only a verified cache record', async () => {
     await fs.writeFile(file, 'not json')
     assert.equal(await removeProjectionCache(sessionId, root), false)
     assert.equal((await fs.lstat(file)).isFile(), true)
+
+    // Unsafe ids never reach a computed path, even if a caller bypassed validation.
+    assert.equal(await removeProjectionCache('../../escape', root), false)
+    assert.equal(await removeProjectionCache('', root), false)
+    assert.equal(await removeProjectionCache(null, root), false)
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
