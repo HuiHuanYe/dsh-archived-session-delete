@@ -62,13 +62,17 @@ window.__ModuleLoader__.load({
       'error.inUse': 'This session is still in use (running or opened elsewhere). Try again later.',
       'error.scheduled': 'This session still has active scheduled tasks. Pause or delete them first.',
       'error.jobs': 'This session still has running background jobs. Wait for or stop them first.',
+      'error.notArchived': 'Only archived sessions can be deleted. Restore the archived filter and retry.',
+      'error.pending': 'This session has not been written to disk yet (send one message first), so it cannot be deleted.',
+      'error.workCheck': 'Could not verify whether this session still runs work; the delete was cancelled.',
+      'error.lineage': 'Could not verify the sub-session scope of this session; the delete was cancelled.',
       'error.migration': 'This session still uses an older storage format and cannot be deleted yet.',
       'error.unsupported': 'The current storage backend does not allow deleting this session safely.',
       'error.unexpected': 'The session directory contains files this plugin does not delete. Nothing was removed.',
       'error.busy': 'Another delete request for this session is already running.',
       'error.invalid': 'The delete request was rejected as invalid.',
       'error.partial': 'Some session files could not be deleted. Try again in a moment.',
-      'error.timeout': 'The delete request timed out. Try again in a moment.',
+      'error.timeout': 'The delete request timed out; it may still be running. Refresh in a moment to check.',
       'error.failed': 'Delete failed: {message}',
       'toast.deleted': 'Deleted archived session “{title}”.',
       'toast.deletedSize': 'Deleted archived session “{title}” and freed {size}.',
@@ -87,13 +91,17 @@ window.__ModuleLoader__.load({
       'error.inUse': '该会话仍在使用中（正在运行或已在别处打开），请稍后再试。',
       'error.scheduled': '该会话还有活动中的定时任务，请先暂停或删除这些任务。',
       'error.jobs': '该会话还有运行中的后台任务，请先等待其结束或停止它们。',
+      'error.notArchived': '只能删除已归档的会话。请切换到归档视图后重试。',
+      'error.pending': '该会话还没有落盘（先发送一条消息即可），暂不能删除。',
+      'error.workCheck': '无法确认该会话是否仍有运行中的任务，已中止删除。',
+      'error.lineage': '无法确认该会话的子会话范围，已中止删除。',
       'error.migration': '该会话仍使用旧版存储格式，暂不能直接删除。',
       'error.unsupported': '当前存储后端不支持安全删除该会话。',
       'error.unexpected': '会话目录中存在本插件不会删除的文件，已放弃删除。',
       'error.busy': '该会话已有一个删除操作在进行中。',
       'error.invalid': '删除请求不合法，已被拒绝。',
       'error.partial': '部分会话文件删除失败，请稍后重试。',
-      'error.timeout': '删除请求超时，请稍后重试。',
+      'error.timeout': '请求超时：删除可能仍在后台进行，请稍后刷新确认结果。',
       'error.failed': '删除失败：{message}',
       'toast.deleted': '已删除归档会话「{title}」。',
       'toast.deletedSize': '已删除归档会话「{title}」，释放 {size}。',
@@ -243,6 +251,14 @@ window.__ModuleLoader__.load({
           return t('error.scheduled')
         case 'session-jobs-running':
           return t('error.jobs')
+        case 'session-not-archived':
+          return t('error.notArchived')
+        case 'session-pending':
+          return t('error.pending')
+        case 'work-check-unavailable':
+          return t('error.workCheck')
+        case 'lineage-unavailable':
+          return t('error.lineage')
         case 'storage-migration-required':
           return t('error.migration')
         case 'storage-unsupported':

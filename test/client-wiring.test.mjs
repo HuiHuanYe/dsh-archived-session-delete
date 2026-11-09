@@ -356,6 +356,41 @@ test('an unsupported storage backend keeps its dedicated explanation', async () 
   }
 })
 
+test('archived, pending, work-check and lineage refusals keep dedicated explanations', async () => {
+  const definition = await loadClientHalf()
+  const plugin = definition.factory(() => reactStub)
+  const cases = [
+    { code: 'session-not-archived', message: /只能删除已归档/ },
+    { code: 'session-pending', message: /还没有落盘/ },
+    { code: 'work-check-unavailable', message: /无法确认/ },
+    { code: 'lineage-unavailable', message: /子会话范围/ },
+  ]
+  for (const refusal of cases) {
+    const { context, state } = buildContext()
+    plugin.apply(context)
+    const overlayRegistration = state.registrations.find((entry) => entry.options.name === 'shell.overlay')
+    state.menu.resolve({ sessionId: 'session-archived', displayTitle: '旧的实验' })[0].run()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({ ok: false, code: refusal.code, message: refusal.code }),
+    })
+    try {
+      const t = (key) => state.locale.dicts.zh[key] ?? key
+      let tree = expand(overlayRegistration.component({ t }))
+      findAll(tree, (node) => node.props?.className === 'asd-btn asd-btn-danger')[0].props.onClick()
+      await flush()
+      tree = expand(overlayRegistration.component({ t }))
+      const alert = findAll(tree, (node) => node.props?.role === 'alert')[0]
+      assert.ok(alert, `${refusal.code} must render an alert`)
+      assert.match(textOf(alert), refusal.message)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+})
+
 test('a request timeout is reported instead of leaving the dialog busy forever', async () => {
   const definition = await loadClientHalf()
   const plugin = definition.factory(() => reactStub)

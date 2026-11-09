@@ -55,6 +55,7 @@ test('classifySessionArtifact rejects relative, unknown, and root locations', ()
     'session.v4.jsonl.zstd',
     path.join(os.tmpdir(), 'session-uuid', 'notes.txt'),
     path.join(os.tmpdir(), 'session-uuid', 'session.lock'),
+    path.join(os.tmpdir(), 'session-uuid', 'session.notes.jsonl'),
     path.sep + 'session.v4.jsonl.zstd',
     '',
     42,

@@ -3,9 +3,10 @@
  *
  * One authenticated exact Fetch route (`POST /api/archived-sessions.delete`)
  * performs the irreversible operation behind the sidebar's archived-session
- * menu: claim write ownership, delete the session-owned log directory, drop the
- * registry archive entry, remove the derived projection-cache record, and tell
- * connected Clients the Session left the catalog.
+ * menu: verify the Session is archived, claim write ownership for the whole
+ * operation, delete the session-owned log directories children-first, drop the
+ * registry archive entry, remove derived projection-cache records, and tell
+ * connected Clients the Sessions left the catalog.
  *
  * It deliberately refuses to run while anything still owns or targets the
  * Session (a live writer, background jobs, active scheduled tasks) and it never
@@ -42,9 +43,13 @@ const STATUS_BY_CODE = {
   'invalid-request': 400,
   'session-not-found': 404,
   'delete-busy': 409,
+  'session-not-archived': 409,
+  'session-pending': 409,
   'session-in-use': 409,
   'session-jobs-running': 409,
   'session-scheduled': 409,
+  'work-check-unavailable': 409,
+  'lineage-unavailable': 409,
   'storage-migration-required': 409,
   'storage-unsupported': 409,
   'storage-unexpected-entry': 409,
@@ -165,8 +170,9 @@ function failureResponse(error) {
 }
 
 /**
- * Plan, validate, and execute one deletion. Nothing is mutated until every
- * planned artifact passed inspection and every guard passed.
+ * Plan, validate, and execute one deletion. Nothing is mutated until the
+ * Session is archived, every planned artifact passed inspection, and every
+ * work guard passed; each planned write claim is released in the finally.
  * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
  * @param {string} sessionId requested Session.
  * @param {AbortSignal} signal request lifetime.
@@ -174,71 +180,150 @@ function failureResponse(error) {
  */
 async function runDeletion(ctx, sessionId, signal) {
   const persistence = ctx.sessionPersistence
-  const ids = await collectDeletionIds(ctx, sessionId, signal)
-  /** @type {Array<{ sessionId: string, missing: boolean, artifact?: object, bytes?: number }>} */
+  await assertArchived(ctx, sessionId)
+  const nodes = await collectDeletionPlan(ctx, sessionId, signal)
+  /** @type {Array<object>} */
   const plans = []
-  for (const id of ids) {
-    const plan = await inspectSession(ctx, persistence, id, signal)
-    plans.push(plan)
+  try {
+    for (const node of nodes) plans.push(await planSession(persistence, node, signal))
+    // An unarchive between the request and execution cancels the irreversible part.
+    await assertArchived(ctx, sessionId)
+    await assertNoRunningWork(ctx, plans)
+    return await executePlans(ctx, plans)
+  } finally {
+    for (const plan of plans) await closeHandle(plan)
   }
-  await assertNoRunningWork(ctx, plans)
-  return executePlans(ctx, plans)
 }
 
 /**
- * Collect the requested Session and its known subagent descendants, because a
- * deleted parent's descendant logs are unreachable afterwards.
+ * Refuse unless the requested Session is in the registry-global archive set.
+ * The Client hides the action for unarchived rows; this is the authoritative
+ * Host-side gate for stale dialogs, other tabs and direct requests.
+ * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
+ * @param {string} sessionId requested Session.
+ * @returns {Promise<void>} resolution when the Session is archived.
+ */
+async function assertArchived(ctx, sessionId) {
+  const registry = ctx.get('workspaceRegistry')
+  let archivedIds
+  try {
+    archivedIds = registry === undefined ? undefined : registry.archivedSessionIds
+  } catch {
+    archivedIds = undefined
+  }
+  if (!Array.isArray(archivedIds) || !archivedIds.includes(sessionId)) {
+    throw new SessionDeleteFailure('session-not-archived', `session "${sessionId}" is not archived`, { sessionId })
+  }
+}
+
+/**
+ * Collect the requested Session and its subagent descendants, parents first.
+ * Forks carry the lineage field without `origin: 'subagent'` and are independent
+ * conversations, so neither a fork nor its subtree is part of this deletion.
  * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
  * @param {string} sessionId requested Session.
  * @param {AbortSignal} signal request lifetime.
- * @returns {Promise<string[]>} unique session ids in deletion order.
+ * @returns {Promise<Array<{ sessionId: string, parentSessionId: string | undefined }>>} deletion nodes.
  */
-async function collectDeletionIds(ctx, sessionId, signal) {
-  const ids = [sessionId]
+async function collectDeletionPlan(ctx, sessionId, signal) {
+  const nodes = [{ sessionId, parentSessionId: undefined }]
+  const seen = new Set([sessionId])
   const sessionQuery = ctx.get('sessionQuery')
-  if (sessionQuery === undefined) return ids
+  if (sessionQuery === undefined) return nodes
+  let trace
   try {
-    const trace = await sessionQuery.traceSession(sessionId, signal)
-    const walk = (nodes) => {
-      for (const node of nodes) {
-        ids.push(node.session.header.id)
-        walk(node.descendants)
-      }
-    }
-    walk(trace.descendants)
+    trace = await sessionQuery.traceSession(sessionId, signal)
   } catch (error) {
-    // An absent target is reported by the persistence snapshot below; any other
-    // tracing failure only narrows the deletion to the requested Session.
-    if (!isMissingSessionQuery(error)) {
-      console.warn('[archived-session-delete] subagent lineage unavailable:', messageOf(error))
+    // The absence of the target is established by the persistence probe below;
+    // any other lineage failure must not silently narrow the deletion.
+    if (isMissingSessionQuery(error)) {
+      // The root may be gone while its subagent logs survived an earlier partial
+      // removal; the corpus still knows their parent field.
+      return await collectDescendantsFromCorpus(sessionQuery, sessionId, signal, nodes, seen)
+    }
+    throw new SessionDeleteFailure('lineage-unavailable', `cannot trace the subagent lineage: ${messageOf(error)}`, {
+      sessionId,
+    })
+  }
+  const walk = (children, parentSessionId) => {
+    if (!Array.isArray(children)) return
+    for (const node of children) {
+      const header = node?.session?.header
+      if (header === null || typeof header !== 'object') continue
+      if (header.origin !== 'subagent') continue
+      const childId = header.id
+      if (typeof childId !== 'string' || seen.has(childId)) continue
+      seen.add(childId)
+      nodes.push({ sessionId: childId, parentSessionId })
+      walk(node.descendants, childId)
     }
   }
-  return [...new Set(ids)]
-}
-
-/** @param {unknown} error @returns {boolean} whether session-query refused an absent Session. */
-function isMissingSessionQuery(error) {
-  return error !== null && typeof error === 'object' && error.code === 'SESSION_QUERY_SESSION_NOT_FOUND'
+  walk(trace.descendants, sessionId)
+  return nodes
 }
 
 /**
- * Inspect one Session and, when it exists, claim and release write ownership so
- * a live writer or another process is detected before any deletion begins.
- * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
- * @param {{ stat: Function, open: Function }} persistence session persistence service.
- * @param {string} sessionId Session to inspect.
+ * Find descendant Sessions through the corpus when the root itself is absent,
+ * so a retry after a partial removal can still reach leftover subagent logs.
+ * @param {{ filterSessions?: Function }} sessionQuery session query service.
+ * @param {string} sessionId absent root Session.
  * @param {AbortSignal} signal request lifetime.
- * @returns {Promise<{ sessionId: string, missing: boolean, artifact?: object, bytes?: number }>} the plan.
+ * @param {Array<{ sessionId: string, parentSessionId: string | undefined }>} nodes collected nodes.
+ * @param {Set<string>} seen collected ids.
+ * @returns {Promise<Array<{ sessionId: string, parentSessionId: string | undefined }>>} deletion nodes.
  */
-async function inspectSession(ctx, persistence, sessionId, signal) {
+async function collectDescendantsFromCorpus(sessionQuery, sessionId, signal, nodes, seen) {
+  if (typeof sessionQuery.filterSessions !== 'function') return nodes
+  const queue = [sessionId]
+  while (queue.length > 0) {
+    const parentId = queue.shift()
+    let records
+    try {
+      records = await sessionQuery.filterSessions([{ kind: 'parent', values: [parentId] }], signal)
+    } catch (error) {
+      console.warn('[archived-session-delete] descendant lookup unavailable:', messageOf(error))
+      break
+    }
+    for (const record of records ?? []) {
+      const header = record?.header
+      if (header === null || typeof header !== 'object') continue
+      if (header.origin !== 'subagent') continue
+      const childId = header.id
+      if (typeof childId !== 'string' || seen.has(childId)) continue
+      seen.add(childId)
+      nodes.push({ sessionId: childId, parentSessionId: parentId })
+      queue.push(childId)
+    }
+  }
+  return nodes
+}
+
+/**
+ * Inspect one Session and hold its write claim for the rest of the operation.
+ * A held claim is the authoritative "nothing is using this Session" probe and
+ * keeps a resume/append from reviving a log that is about to be deleted.
+ * @param {{ stat: Function, open: Function }} persistence session persistence service.
+ * @param {{ sessionId: string, parentSessionId: string | undefined }} node planned node.
+ * @param {AbortSignal} signal request lifetime.
+ * @returns {Promise<object>} the plan entry (possibly `missing`).
+ */
+async function planSession(persistence, node, signal) {
+  const { sessionId } = node
   let snapshot
   try {
     snapshot = await persistence.stat(sessionId, { signal })
   } catch (error) {
-    if (isPersistenceNotFound(error)) return { sessionId, missing: true }
+    if (isPersistenceNotFound(error)) return { ...node, missing: true }
     throw persistenceFailure(error, sessionId)
   }
-  if (snapshot === undefined) return { sessionId, missing: true }
+  if (snapshot === undefined) {
+    // `stat` also returns undefined for an artifact whose header cannot be
+    // interpreted, so confirm absence through a read open instead of assuming it.
+    if (await probeAbsentSession(persistence, sessionId, signal)) return { ...node, missing: true }
+    throw new SessionDeleteFailure('storage-unsupported', `session "${sessionId}" exists but cannot be inspected`, {
+      sessionId,
+    })
+  }
   if (snapshot.formatStatus === 'migration-required') {
     throw new SessionDeleteFailure(
       'storage-migration-required',
@@ -247,59 +332,74 @@ async function inspectSession(ctx, persistence, sessionId, signal) {
     )
   }
   if (snapshot.location === undefined || typeof snapshot.location.path !== 'string') {
-    // A created-but-never-materialized Session has no artifact to delete.
-    return { sessionId, missing: true }
+    // A created-but-never-materialized Session still lives in process; reporting
+    // it as gone would unarchive and broadcast a removal for a live entity.
+    throw new SessionDeleteFailure('session-pending', `session "${sessionId}" has no durable artifact yet`, {
+      sessionId,
+    })
   }
   const artifact = classifySessionArtifact(snapshot.location.path)
-  const inspected = await inspectSessionArtifact(artifact)
-  await claimWriteOwnership(persistence, sessionId, signal)
-  return { sessionId, missing: false, artifact, bytes: inspected.bytes }
-}
-
-/**
- * Open and promptly close a write handle. The backend's single-writer claim is
- * the authoritative "is anything still using this Session" probe.
- * @param {{ open: Function }} persistence session persistence service.
- * @param {string} sessionId Session to claim.
- * @param {AbortSignal} signal request lifetime.
- * @returns {Promise<void>} resolution after ownership was claimed and released.
- */
-async function claimWriteOwnership(persistence, sessionId, signal) {
   let handle
   try {
     handle = await persistence.open(sessionId, 'write', { signal })
   } catch (error) {
-    if (isPersistenceNotFound(error)) {
-      throw new SessionDeleteFailure('session-not-found', `session "${sessionId}" disappeared during deletion`, { sessionId })
-    }
+    if (isPersistenceNotFound(error)) return { ...node, missing: true }
     if (isPersistenceOwned(error)) {
-      throw new SessionDeleteFailure('session-in-use', `session "${sessionId}" is still owned by a live writer`, { sessionId })
+      throw new SessionDeleteFailure('session-in-use', `session "${sessionId}" is still owned by a live writer`, {
+        sessionId,
+      })
     }
     throw persistenceFailure(error, sessionId)
   }
+  let inspected
   try {
-    await handle.close()
+    inspected = await inspectSessionArtifact(artifact)
   } catch (error) {
-    console.warn('[archived-session-delete] could not release the write claim:', messageOf(error))
+    await closeHandle({ sessionId, handle })
+    throw error
   }
+  return { ...node, missing: false, artifact, bytes: inspected.bytes, handle }
+}
+
+/**
+ * Confirm that an id `stat` could not describe really has no artifact.
+ * @param {{ open: Function }} persistence session persistence service.
+ * @param {string} sessionId Session to probe.
+ * @param {AbortSignal} signal request lifetime.
+ * @returns {Promise<boolean>} whether the Session is definitely absent.
+ */
+async function probeAbsentSession(persistence, sessionId, signal) {
+  let handle
+  try {
+    handle = await persistence.open(sessionId, 'read', { signal })
+  } catch (error) {
+    if (isPersistenceNotFound(error)) return true
+    throw persistenceFailure(error, sessionId)
+  }
+  await closeHandle({ sessionId, handle })
+  return false
 }
 
 /**
  * Refuse the deletion while a Session still has running background jobs or an
- * active scheduled task targeting it.
+ * active scheduled task whose target names it (`session` and reserved
+ * `new_once` targets both carry a `sessionId`).
  * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
- * @param {Array<{ sessionId: string, missing: boolean }>} plans planned deletions.
+ * @param {Array<object>} plans planned deletions.
  * @returns {Promise<void>} resolution when the deletion may proceed.
  */
 async function assertNoRunningWork(ctx, plans) {
   const jobs = ctx.get('jobs')
   if (jobs !== undefined) {
     for (const plan of plans) {
-      let owned = []
+      if (plan.missing) continue
+      let owned
       try {
         owned = jobs.list(plan.sessionId) ?? []
-      } catch {
-        continue
+      } catch (error) {
+        throw new SessionDeleteFailure('work-check-unavailable', `cannot inspect background jobs: ${messageOf(error)}`, {
+          sessionId: plan.sessionId,
+        })
       }
       const running = owned.filter((job) => job.status === 'running' || job.status === 'stopping')
       if (running.length > 0) {
@@ -316,12 +416,16 @@ async function assertNoRunningWork(ctx, plans) {
   try {
     catalog = await schedule.catalog()
   } catch (error) {
-    console.warn('[archived-session-delete] scheduled-task catalog unavailable:', messageOf(error))
-    return
+    throw new SessionDeleteFailure('work-check-unavailable', `cannot inspect scheduled tasks: ${messageOf(error)}`)
   }
-  const wanted = new Set(plans.map((plan) => plan.sessionId))
+  const wanted = new Set(plans.filter((plan) => !plan.missing).map((plan) => plan.sessionId))
   const active = catalog.filter(
-    (task) => task.status === 'active' && task.target?.kind === 'session' && wanted.has(task.target.sessionId),
+    (task) =>
+      task.status === 'active'
+      && task.target !== null
+      && typeof task.target === 'object'
+      && task.target.kind !== 'new'
+      && wanted.has(task.target.sessionId),
   )
   if (active.length > 0) {
     throw new SessionDeleteFailure('session-scheduled', 'a Session with active scheduled tasks cannot be deleted', {
@@ -332,83 +436,104 @@ async function assertNoRunningWork(ctx, plans) {
 }
 
 /**
- * Delete every planned artifact, then clean registry/derived state and notify
- * connected Clients. Per-artifact removal is best-effort: the response reports
- * partial failures while every successful removal still updates the UI.
+ * Delete every planned artifact deepest-first, then clean registry/derived state
+ * and notify connected Clients. A descendant failure blocks its ancestors, so a
+ * retry can still reach the remaining log; removals that already happened are
+ * still reflected in the response and on every connected page.
  * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
- * @param {Array<{ sessionId: string, missing: boolean, artifact?: object, bytes?: number }>} plans planned deletions.
+ * @param {Array<object>} plans planned deletions, parents first.
  * @returns {Promise<Response>} the JSON response.
  */
 async function executePlans(ctx, plans) {
   const registry = ctx.get('workspaceRegistry')
-  /** @type {string[]} */
-  const removed = []
+  /** @type {Set<string>} */
+  const removed = new Set()
   /** @type {Array<{ sessionId: string, message: string }>} */
   const failures = []
   /** @type {string[]} */
-  const warnings = []
+  const skipped = []
   let bytes = 0
   let cacheRemoved = 0
 
-  for (const plan of plans) {
+  const parentOf = new Map(plans.map((plan) => [plan.sessionId, plan.parentSessionId]))
+  const ancestorsOf = (sessionId) => {
+    const chain = []
+    let current = parentOf.get(sessionId)
+    while (current !== undefined && !chain.includes(current) && chain.length < 64) {
+      chain.push(current)
+      current = parentOf.get(current)
+    }
+    return chain
+  }
+  const blocked = new Set()
+
+  for (const plan of [...plans].reverse()) {
     if (plan.missing) {
-      removed.push(plan.sessionId)
+      removed.add(plan.sessionId)
+      if (await removeProjectionCache(plan.sessionId)) cacheRemoved += 1
       continue
     }
-    let cleanupWarning
+    if (blocked.has(plan.sessionId)) {
+      skipped.push(plan.sessionId)
+      continue
+    }
     try {
-      cleanupWarning = await removeSessionArtifact(plan.artifact)
+      await removeSessionArtifact(plan.artifact)
     } catch (error) {
       failures.push({ sessionId: plan.sessionId, message: messageOf(error) })
+      for (const ancestor of ancestorsOf(plan.sessionId)) blocked.add(ancestor)
       continue
     }
-    if (cleanupWarning !== undefined) {
-      warnings.push(`${plan.sessionId}: ${cleanupWarning}`)
-      console.warn('[archived-session-delete]', cleanupWarning)
-    }
+    removed.add(plan.sessionId)
     bytes += plan.bytes ?? 0
-    removed.push(plan.sessionId)
     if (await removeProjectionCache(plan.sessionId)) cacheRemoved += 1
   }
 
   for (const plan of plans) {
-    if (!plan.missing) continue
-    if (await removeProjectionCache(plan.sessionId)) cacheRemoved += 1
-  }
-
-  for (const sessionId of removed) {
+    if (!removed.has(plan.sessionId)) continue
     if (registry !== undefined) {
       try {
-        await registry.unarchiveSession(sessionId)
+        await registry.unarchiveSession(plan.sessionId)
       } catch (error) {
         console.warn('[archived-session-delete] could not clear the archive entry:', messageOf(error))
       }
     }
-    emitSessionRemoved(ctx, sessionId)
+    emitSessionRemoved(ctx, plan.sessionId)
   }
 
+  const removedSessionIds = plans.filter((plan) => removed.has(plan.sessionId)).map((plan) => plan.sessionId)
   if (failures.length > 0) {
     return json(500, {
       ok: false,
       code: 'delete-partial',
       message: 'some session artifacts could not be removed',
-      details: {
-        failures,
-        removedSessionIds: removed,
-        bytes,
-        ...(warnings.length === 0 ? {} : { warnings }),
-      },
+      details: { failures, removedSessionIds, skippedSessionIds: skipped, bytes },
     })
   }
   return json(200, {
     ok: true,
     sessionId: plans[0]?.sessionId,
-    removedSessionIds: removed,
+    removedSessionIds,
     bytes,
     cacheRemoved,
     alreadyGone: plans.every((plan) => plan.missing),
-    ...(warnings.length === 0 ? {} : { warnings }),
   })
+}
+
+/**
+ * Release one held write claim; a failed close never fails the deletion.
+ * @param {{ sessionId: string, handle?: { close: Function } }} plan planned entry.
+ * @returns {Promise<void>} resolution after close settled.
+ */
+async function closeHandle(plan) {
+  if (plan.handle === undefined) return
+  const handle = plan.handle
+  plan.handle = undefined
+  try {
+    await handle.close()
+  } catch (error) {
+    console.warn(`[archived-session-delete] could not release the write claim for "${plan.sessionId}":`, messageOf(error))
+  }
 }
 
 /**
@@ -424,6 +549,11 @@ function emitSessionRemoved(ctx, sessionId) {
   } catch (error) {
     console.warn('[archived-session-delete] could not announce the removal:', messageOf(error))
   }
+}
+
+/** @param {unknown} error @returns {boolean} whether session-query refused an absent Session. */
+function isMissingSessionQuery(error) {
+  return error !== null && typeof error === 'object' && error.code === 'SESSION_QUERY_SESSION_NOT_FOUND'
 }
 
 /** @param {unknown} error @returns {string} a printable message. */
